@@ -390,36 +390,6 @@ class ZephyrMacroAllocator(QCAlgorithm):
         prices = closes[symbol]
         return float(prices.iloc[-1] / prices.iloc[-127] - 1)
 
-    def compute_momentum(self, symbols: List[Symbol], closes: pd.DataFrame) -> Dict[Symbol, float]:
-        """
-        Compute multi-horizon momentum scores for a list of assets.
-
-        Parameters
-        ----------
-        symbols : list[Symbol]
-            Assets for which momentum should be computed.
-        closes : pandas.DataFrame
-            DataFrame of historical close prices indexed by date and symbol.
-
-        Returns
-        -------
-        dict
-            Mapping from Symbol to momentum score. Assets with insufficient
-            data are excluded.
-        """
-        scores = {}
-        for symbol in symbols:
-            if symbol not in closes.columns:
-                continue
-            prices = closes[symbol].replace(0, np.nan).dropna()
-            if len(prices) < self.max_lookback + 1:
-                continue
-            scores[symbol] = float(np.mean([
-                prices.iloc[-1] / prices.iloc[-(lb + 1)] - 1
-                for lb in self.momentum_lookbacks
-            ]))
-        return scores
-
     def get_duration_regime_for_group(self, closes: pd.DataFrame, symbols: List[Symbol]) -> List[Symbol]:
         """
         Select bond assets based on a duration momentum regime.
@@ -490,16 +460,11 @@ class ZephyrMacroAllocator(QCAlgorithm):
         """
         values = []
         for symbol in symbols:
-            if symbol not in closes.columns or len(closes[symbol]) < 253:
-                continue
-            prices = closes[symbol].replace(0, np.nan).dropna()
-            values.append(np.mean([
-                prices.iloc[-1] / prices.iloc[-22] - 1,
-                prices.iloc[-1] / prices.iloc[-64] - 1,
-                prices.iloc[-1] / prices.iloc[-127] - 1,
-                prices.iloc[-1] / prices.iloc[-190] - 1,
-                prices.iloc[-1] / prices.iloc[-253] - 1,
-            ]))
+            mom = self.compute_asset_momentum(symbol, closes)
+
+            if np.isfinite(mom):
+                values.append(mom)
+                
         return float(np.mean(values)) if values else 0.0
 
     def compute_asset_momentum(self, symbol: Symbol, closes: pd.DataFrame) -> float:
