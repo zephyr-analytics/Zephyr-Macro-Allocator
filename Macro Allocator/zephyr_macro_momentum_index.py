@@ -3,6 +3,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
+
 class ZephyrMacroAllocator(QCAlgorithm):
     """
     A multi-asset macro allocation algorithm that uses dual-momentum, 
