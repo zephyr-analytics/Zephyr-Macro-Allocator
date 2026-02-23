@@ -8,10 +8,9 @@ import yfinance as yf
 CRYPTO_CAP = 0.10
 ENABLE_SMA_FILTER = True
 ENABLE_TREASURY_KILL_SWITCH = True
-USE_GROUP_MOMENTUM = False 
 
-WINRATE_LOOKBACK = 126
-VOL_LOOKBACK = 126
+WINRATE_LOOKBACK = 21   # Matched to your QC update
+VOL_LOOKBACK = 252      # Matched to your QC update
 
 SMA_PERIOD = 147
 BOND_SMA_PERIOD = 126
@@ -23,13 +22,14 @@ MAX_LOOKBACK = max(MOMENTUM_LOOKBACKS)
 # ASSET GROUPS
 # ============================
 GROUPS = {
-    "real": ["GLD", "PDBC"],
+    "real": ["GLD", "DBC"],
     "corp_bonds": ["VCSH", "VCIT", "VCLT"],
     "treasury_bonds": ["VGSH", "VGIT", "VGLT"],
     "high_yield_bonds": ["SHYG", "HYG"],
-    "equities": ["VTI", "VEA", "VWO"],
-    "equity_income": ["VIG", "VYM", "VIGI", "VYMI"],
-    "crypto": ["IBIT", "ETHA"], 
+    "sectors": ["IXN", "IXJ", "IXC", "IXG", "RXI", "KXI", "EXI", "IXP", "MXI", "JXI", "REET"],
+    "us_factor": ["MTUM", "IUSV", "IUSG", "USMV", "QUAL", "DGRO"],
+    "int_factor": ["IMTM", "EFV", "EFG", "EFAV", "IQLT", "IGRO"],
+    "crypto": ["IBIT", "ETHA"], # yfinance format
     "cash": ["SHV"]
 }
 
@@ -41,9 +41,9 @@ BOND_GROUPS = {"corp_bonds", "treasury_bonds", "high_yield_bonds"}
 tickers = sorted(set(sum(GROUPS.values(), [])))
 raw_data = yf.download(tickers, period="2y", auto_adjust=True, progress=False)
 
-closes = raw_data["Close"].dropna(how="all")
-highs = raw_data["High"]
-lows = raw_data["Low"]
+closes = raw_data["Close"].ffill().dropna(how="all")
+highs = raw_data["High"].ffill()
+lows = raw_data["Low"].ffill()
 
 # ============================
 # CORE FUNCTIONS
@@ -57,12 +57,12 @@ def compute_manual_adx(ticker, period=14):
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
     tr = pd.concat([h - l, abs(h - c.shift(1)), abs(l - c.shift(1))], axis=1).max(axis=1)
     alpha = 1 / period
-    s_plus_dm = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean()
-    s_minus_dm = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean()
+    s_plus_dm = pd.Series(plus_dm, index=h.index).ewm(alpha=alpha, adjust=False).mean()
+    s_minus_dm = pd.Series(minus_dm, index=h.index).ewm(alpha=alpha, adjust=False).mean()
     s_tr = tr.ewm(alpha=alpha, adjust=False).mean()
     plus_di = 100 * (s_plus_dm / s_tr)
     minus_di = 100 * (s_minus_dm / s_tr)
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-9))
     return dx.ewm(alpha=alpha, adjust=False).mean().iloc[-1]
 
 def passes_trend(t):
@@ -72,8 +72,9 @@ def passes_trend(t):
     ma = px.rolling(period).mean()
     return px.iloc[-1] > ma.iloc[-1]
 
-def momentum(t):
+def momentum_score(t):
     px = closes[t]
+    if len(px) < MAX_LOOKBACK + 1: return -np.inf
     return np.mean([px.iloc[-1] / px.iloc[-(lb + 1)] - 1 for lb in MOMENTUM_LOOKBACKS])
 
 def duration_regime(symbols):
@@ -102,35 +103,52 @@ risk_groups = {g: (duration_regime(GROUPS[g]) if g in BOND_GROUPS else GROUPS[g]
 edges, group_assets, group_asset_edges = {}, {}, {}
 
 for group, symbols in risk_groups.items():
-    eligible, asset_edges, asset_adxs = [], {}, {}
+    eligible_candidates = {}
 
     for s in symbols:
-        if not passes_trend(s): continue
+        if s not in closes.columns or not passes_trend(s): continue
         m_6m = closes[s].iloc[-1] / closes[s].iloc[-127] - 1
-        mom = momentum(s)
+        mom = momentum_score(s)
         if m_6m < bil_6m or mom <= 0: continue
-        
-        eligible.append(s)
-        asset_edges[s] = mom
-        asset_adxs[s] = compute_manual_adx(s)
+        eligible_candidates[s] = mom
 
-    if not eligible: continue
+    if not eligible_candidates: continue
 
+    # --- TOP N SELECTION LOGIC (NEW) ---
+    if group in ["int_factor", "us_factor"]:
+        top_keys = sorted(eligible_candidates, key=eligible_candidates.get, reverse=True)[:3]
+    elif group == "sectors":
+        top_keys = sorted(eligible_candidates, key=eligible_candidates.get, reverse=True)[:2]
+    else:
+        top_keys = list(eligible_candidates.keys())
+
+    # Filter candidates to top selection
+    asset_edges = {k: eligible_candidates[k] for k in top_keys}
+    eligible = list(asset_edges.keys())
+
+    # Weight construction for the representative basket
     edge_series = pd.Series(asset_edges)
     asset_weights = edge_series / edge_series.sum()
+    
+    # Group Statistics
     weighted_group_rets = (closes[eligible].pct_change() * asset_weights).sum(axis=1).dropna()
     log_group = np.log1p(weighted_group_rets)
+    
+    if len(log_group) < max(WINRATE_LOOKBACK, VOL_LOOKBACK): continue
 
-    win_rate = (log_group.tail(WINRATE_LOOKBACK) > 0).mean()
-    group_vol = np.std(log_group.tail(VOL_LOOKBACK)) * np.sqrt(252)
-    group_adx = (pd.Series(asset_adxs) * asset_weights).sum()
+    win_rate = float((log_group.tail(WINRATE_LOOKBACK) > 0).mean())
+    group_vol = float(np.std(log_group.tail(VOL_LOOKBACK)) * np.sqrt(252))
+    group_adx = (pd.Series({s: compute_manual_adx(s) for s in eligible}) * asset_weights).sum()
     group_momentum = (edge_series * asset_weights).sum()
 
     if group_vol <= 0: continue
 
+    # Final Confidence & Edge (MATCHED TO QC)
     confidence = (group_momentum * group_adx) / (group_vol + 1e-6)
-    edges[group] = group_momentum * group_adx if USE_GROUP_MOMENTUM else win_rate * (1.0 + confidence)
-    group_assets[group], group_asset_edges[group] = eligible, asset_edges
+    edges[group] = win_rate * (confidence)
+    
+    group_assets[group] = eligible
+    group_asset_edges[group] = asset_edges
 
 # ============================
 # FINAL ALLOCATION
@@ -159,7 +177,9 @@ else:
     alloc["SHV"] = cash_weight
 
 # Summary Prints
+print("-" * 30)
 print("GROUPS | " + " | ".join(f"{g}:{w:.2f}" for g, w in sorted(weights.items())) + f" | cash:{cash_weight:.2f}")
+print("-" * 30)
 print("\nFINAL SIGNALS (%)\n")
 out = pd.Series(alloc).sort_values(ascending=False)
 print((out * 100).round(2))

@@ -39,15 +39,15 @@ class ZephyrMacroAllocator(QCAlgorithm):
         """
         self.set_start_date(2012, 1, 1)
         self.set_cash(100_000)
-
+        self.set_benchmark("AOR")
         # ============================
         # user options
         # ============================
         self.enable_sma_filter = True
         self.enable_treasury_kill_switch = True
-        self.use_group_momentum = False
-        self.winrate_lookback = 126
-        self.vol_lookback = 126
+
+        self.winrate_lookback = 21
+        self.vol_lookback = 252
 
         self.sma_period = 147
         self.bond_sma_period = 126
@@ -64,8 +64,9 @@ class ZephyrMacroAllocator(QCAlgorithm):
             "corp_bonds": ["VCSH", "VCIT", "VCLT"],
             "treasury_bonds": ["VGSH", "VGIT", "VGLT"],
             "high_yield_bonds": ["SHYG", "HYG"],
-            "equities": ["VTI", "VEA", "VWO"],
-            "equity_income": ["VIG", "VYM", "VIGI", "VYMI"],
+            "sectors": ["IXN", "IXJ", "IXC", "IXG", "RXI", "KXI", "EXI", "IXP", "MXI", "JXI", "REET"],
+            "us_factor": ["MTUM", "IUSV", "IUSG", "USMV", "QUAL", "DGRO"],
+            "int_factor": ["IMTM", "EFV", "EFG", "EFAV", "IQLT", "IGRO"],
             "crypto": ["BTCUSD", "ETHUSD"],
             "cash": ["SHV"]
         }
@@ -236,8 +237,9 @@ class ZephyrMacroAllocator(QCAlgorithm):
             "corp_bonds": corp_bonds,
             "treasury_bonds": treasury_bonds,
             "high_yield_bonds": high_yield_bonds,
-            "equities": self.symbols["equities"],
-            "equity_income": self.symbols["equity_income"],
+            "sectors": self.symbols["sectors"],
+            "us_factor": self.symbols["us_factor"],
+            "int_factor": self.symbols["int_factor"],
             "crypto": self.symbols["crypto"]
         }
 
@@ -250,64 +252,68 @@ class ZephyrMacroAllocator(QCAlgorithm):
         # group + asset edge construction
         # ============================
         for group, symbols in risk_groups.items():
-            eligible = []
-            asset_edges = {}
-            asset_adxs = {}
+            eligible_candidates = {} # Temporary store for all trend-passing assets
 
             for s in symbols:
-                if s not in closes.columns:
-                    continue
-                if not self.passes_trend(s):
-                    continue
+                if s not in closes.columns: continue
+                if not self.passes_trend(s): continue
 
                 asset_momentum = self.compute_asset_momentum(s, closes)
                 asset_6m = self.six_month_return(s, closes)
 
+                # Basic inclusion filters
                 if asset_6m < bil_6m or asset_momentum <= 0:
                     continue
 
-                s_data = history.loc[s]
-                current_adx = self.compute_manual_adx(
-                            s_data['high'], 
-                            s_data['low'], 
-                            s_data['close']
-                        )
+                eligible_candidates[s] = asset_momentum
 
-                # 2. Multiply momentum by ADX to get the adjusted edge
-                asset_edge = asset_momentum * current_adx
-                asset_edge = asset_momentum
-                eligible.append(s)
-                asset_edges[s] = asset_edge
-
-            if not eligible:
+            if not eligible_candidates:
                 continue
 
-            # 1. Create a weight series from asset_edges
+            # --- TOP 3 SELECTION LOGIC ---
+            if group in ["int_factor", "us_factor"]:
+                # Logic specifically for Factor groups
+                top_3_keys = sorted(eligible_candidates, key=eligible_candidates.get, reverse=True)[:3]
+                eligible = top_3_keys
+                asset_edges = {s: eligible_candidates[s] for s in top_3_keys}
+
+            elif group == "sectors":
+                # Separate logic for Global Sectors
+                # This is now independent so you can adjust the count or sorting metric later
+                top_3_keys = sorted(eligible_candidates, key=eligible_candidates.get, reverse=True)[:2]
+                eligible = top_3_keys
+                asset_edges = {s: eligible_candidates[s] for s in top_3_keys}
+
+            else:
+                # Default for real, bonds, crypto, etc.
+                eligible = list(eligible_candidates.keys())
+                asset_edges = eligible_candidates
+
+            # 1. Create weights based only on the Top 3 (or all if not a factor/sector group)
             edge_series = pd.Series(asset_edges)
             asset_weights = edge_series / edge_series.sum()
 
-            # 3. Construct the Weighted Return Series
-            # This is the "Weighted Group Performance" day-by-day
+            # 2. Construct the Weighted Return Series (Representative of the Top 3)
             group_returns_df = closes[eligible].pct_change()
             weighted_group_returns = (group_returns_df * asset_weights).sum(axis=1).dropna()
 
             if len(weighted_group_returns) < max(self.winrate_lookback, self.vol_lookback):
                 continue
 
-            # 4. Group ADX (Weighted Average of Asset ADXs)
+            # 3. Calculate Group ADX for the Top 3
+            asset_adxs = {s: self.compute_manual_adx(history.loc[s]['high'], 
+                                                     history.loc[s]['low'], 
+                                                     history.loc[s]['close']) for s in eligible
+            }
+
             group_adx = (pd.Series(asset_adxs) * asset_weights).sum()
 
-            # 5. Group Momentum (Weighted Average)
+            # 4. Group Momentum (Weighted Average of Top 3)
             group_momentum = (edge_series * asset_weights).sum()
 
-            # 6. CALCULATE WEIGHTED WIN RATE & VOLATILITY
-            # Using the log of the weighted return series
+            # 5. Calculate Weighted Win Rate & Volatility for the Top 3 basket
             log_group = np.log1p(weighted_group_returns)
-
-            # Weighted Win Rate: Frequency of positive days in the weighted basket
             win_rate = float(np.mean(log_group.tail(self.winrate_lookback) > 0))
-
-            # Weighted Group Vol: Annualized StdDev of the weighted basket
             group_vol = float(np.std(log_group.tail(self.vol_lookback)) * np.sqrt(252))
 
             if not np.isfinite(group_vol) or group_vol <= 0:
@@ -315,14 +321,10 @@ class ZephyrMacroAllocator(QCAlgorithm):
 
             vols[group] = group_vol
 
-            # 7. Final Confidence & Edge Construction
-            # Incorporating the Group ADX as a multiplier for trend quality
+            # 6. Final Confidence & Edge Construction
             confidence = (group_momentum * group_adx) / (group_vol + 1e-6)
 
-            if self.use_group_momentum:
-                edges[group] = group_momentum * group_adx
-            else:
-                edges[group] = win_rate * (1.0 + confidence)
+            edges[group] = win_rate * (confidence)
 
             group_assets[group] = eligible
             group_asset_edges[group] = asset_edges
@@ -522,35 +524,34 @@ class ZephyrMacroAllocator(QCAlgorithm):
 
 
     def compute_manual_adx(self, high, low, close, period=14):
-        # 1. Calculate +DM and -DM (Directional Movement)
+        # 1. Directional Movement
         up_move = high.diff()
         down_move = -low.diff()
 
-        # Apply your logic: If move is positive and greater than the other, keep it
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
 
-        # 2. True Range (TR) - Required to normalize the DI values
-        tr1 = high - low
-        tr2 = abs(high - close.shift(1))
-        tr3 = abs(low - close.shift(1))
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        # 2. True Range
+        tr = pd.concat([
+            high - low,
+            abs(high - close.shift(1)),
+            abs(low - close.shift(1))
+        ], axis=1).max(axis=1)
 
-        # 3. Calculate the Averages (Using Wilder's Smoothing / EMA)
-        # We smooth TR, +DM, and -DM over the period
+        # 3. Wilder's Smoothing (alpha = 1/N is the standard for ADX)
         alpha = 1 / period
-        smooth_plus_dm = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean()
-        smooth_minus_dm = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean()
-        smooth_tr = tr.ewm(alpha=alpha, adjust=False).mean()
+        # Use min_periods to ensure we have enough data before returning a value
+        s_plus_dm = pd.Series(plus_dm, index=high.index).ewm(alpha=alpha, adjust=False).mean()
+        s_minus_dm = pd.Series(minus_dm, index=high.index).ewm(alpha=alpha, adjust=False).mean()
+        s_tr = tr.ewm(alpha=alpha, adjust=False).mean()
 
-        # 4. Calculate DI+ and DI-
-        plus_di = 100 * (smooth_plus_dm / smooth_tr)
-        minus_di = 100 * (smooth_minus_dm / smooth_tr)
+        # 4. DI+ / DI-
+        plus_di = 100 * (s_plus_dm / s_tr)
+        minus_di = 100 * (s_minus_dm / s_tr)
 
-        # 5. Calculate DX (Your step: |DI+ - DI-| / |DI+ + DI-| * 100)
-        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
-
-        # 6. Final ADX (The average of DX over time)
+        # 5. DX & ADX
+        # Using clip(lower=1e-9) prevents division by zero
+        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).clip(lower=1e-9))
         adx = dx.ewm(alpha=alpha, adjust=False).mean()
 
-        return adx.iloc[-1] # Return the most recent value
+        return adx.iloc[-1]
