@@ -45,6 +45,7 @@ class ZephyrMacroAllocator(QCAlgorithm):
         # ============================
         self.enable_sma_filter = True
         self.enable_treasury_kill_switch = True
+        self.enable_volume_momentum = True
 
         self.winrate_lookback = 21
         self.vol_lookback = 252
@@ -52,6 +53,9 @@ class ZephyrMacroAllocator(QCAlgorithm):
         self.sma_period = 147
         self.bond_sma_period = 126
         self.crypto_cap = 0.10
+
+        self.volume_momentum_period = 20
+        self.volume_momentum_lookback = 50
 
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
         self.max_lookback = max(self.momentum_lookbacks)
@@ -65,8 +69,9 @@ class ZephyrMacroAllocator(QCAlgorithm):
             "treasury_bonds": ["VGSH", "VGIT", "VGLT"],
             "high_yield_bonds": ["SHYG", "HYG"],
             "sectors": ["IXN", "IXJ", "IXC", "IXG", "RXI", "KXI", "EXI", "IXP", "MXI", "JXI", "REET"],
-            "us_factor": ["MTUM", "IUSV", "IUSG", "USMV", "QUAL", "DGRO"],
-            "int_factor": ["IMTM", "EFV", "EFG", "EFAV", "IQLT", "IGRO"],
+            "us_factor": ["MTUM", "ITOT", "VLUE", "USMV", "QUAL", "DGRO", "SIZE"],
+            "int_factor": ["IMTM", "EFA", "IVLU", "EFAV", "IQLT", "IGRO", "SCZ"],
+            "em_factor": ["EEM", "EVLU", "EEMV", "EQLT", "DGRE", "EEMS"],
             "crypto": ["BTCUSD", "ETHUSD"],
             "cash": ["SHV"]
         }
@@ -221,7 +226,7 @@ class ZephyrMacroAllocator(QCAlgorithm):
         cash_symbol = self.symbols["cash"][0]
 
         bil_6m = self.six_month_return(cash_symbol, closes)
-
+        self.debug(f"Cash Hurdle: {bil_6m}")
         corp_bonds = self.get_duration_regime_for_group(
             closes, self.symbols["corp_bonds"]
         )
@@ -240,7 +245,8 @@ class ZephyrMacroAllocator(QCAlgorithm):
             "sectors": self.symbols["sectors"],
             "us_factor": self.symbols["us_factor"],
             "int_factor": self.symbols["int_factor"],
-            "crypto": self.symbols["crypto"]
+            "crypto": self.symbols["crypto"],
+            "em_factor": self.symbols["em_factor"]
         }
 
         vols = {}
@@ -265,13 +271,19 @@ class ZephyrMacroAllocator(QCAlgorithm):
                 if asset_6m < bil_6m or asset_momentum <= 0:
                     continue
 
-                eligible_candidates[s] = asset_momentum
+                # Volume Momentum Confirmation
+                vol_mom = 1.0
+                if self.enable_volume_momentum:
+                    vol_mom = self.compute_volume_momentum(s, history)
+
+                combined_edge = asset_momentum * (1.0 + np.tanh(vol_mom))
+                eligible_candidates[s] = combined_edge
 
             if not eligible_candidates:
                 continue
 
             # --- TOP 3 SELECTION LOGIC ---
-            if group in ["int_factor", "us_factor"]:
+            if group in ["int_factor", "us_factor", "em_factor"]:
                 # Logic specifically for Factor groups
                 top_3_keys = sorted(eligible_candidates, key=eligible_candidates.get, reverse=True)[:3]
                 eligible = top_3_keys
@@ -280,7 +292,7 @@ class ZephyrMacroAllocator(QCAlgorithm):
             elif group == "sectors":
                 # Separate logic for Global Sectors
                 # This is now independent so you can adjust the count or sorting metric later
-                top_3_keys = sorted(eligible_candidates, key=eligible_candidates.get, reverse=True)[:2]
+                top_3_keys = sorted(eligible_candidates, key=eligible_candidates.get, reverse=True)[:3]
                 eligible = top_3_keys
                 asset_edges = {s: eligible_candidates[s] for s in top_3_keys}
 
@@ -300,18 +312,10 @@ class ZephyrMacroAllocator(QCAlgorithm):
             if len(weighted_group_returns) < max(self.winrate_lookback, self.vol_lookback):
                 continue
 
-            # 3. Calculate Group ADX for the Top 3
-            asset_adxs = {s: self.compute_manual_adx(history.loc[s]['high'], 
-                                                     history.loc[s]['low'], 
-                                                     history.loc[s]['close']) for s in eligible
-            }
-
-            group_adx = (pd.Series(asset_adxs) * asset_weights).sum()
-
-            # 4. Group Momentum (Weighted Average of Top 3)
+            # 3. Group Momentum (Weighted Average of Top 3)
             group_momentum = (edge_series * asset_weights).sum()
 
-            # 5. Calculate Weighted Win Rate & Volatility for the Top 3 basket
+            # 4. Calculate Weighted Win Rate & Volatility for the Top 3 basket
             log_group = np.log1p(weighted_group_returns)
             win_rate = float(np.mean(log_group.tail(self.winrate_lookback) > 0))
             group_vol = float(np.std(log_group.tail(self.vol_lookback)) * np.sqrt(252))
@@ -321,24 +325,36 @@ class ZephyrMacroAllocator(QCAlgorithm):
 
             vols[group] = group_vol
 
-            # 6. Final Confidence & Edge Construction
-            confidence = (group_momentum * group_adx) / (group_vol + 1e-6)
+            # 5. Volume Momentum Confirmation
+            volume_multiplier = 1.0
+            if self.enable_volume_momentum:
+                asset_vol_momentums = {}
+                for s in eligible:
+                    vol_mom = self.compute_volume_momentum(s, history)
+                    asset_vol_momentums[s] = vol_mom
+                
+                group_vol_momentum = (pd.Series(asset_vol_momentums) * asset_weights).sum()
+                volume_multiplier = 1.0 + np.tanh(group_vol_momentum)
 
-            edges[group] = win_rate * (confidence)
+            # 6. Final Confidence & Edge Construction
+            confidence = (group_momentum) / (group_vol + 1e-6)
+
+            edges[group] = win_rate * confidence * volume_multiplier
 
             group_assets[group] = eligible
             group_asset_edges[group] = asset_edges
 
         if not edges:
+            self.debug("No groups moving to cash.")
             self.SetHoldings(cash_symbol, 1.0)
             return
 
         # ====================================================
-        # UPDATED TREASURY KILL SWITCH (trend-only)
+        # Lack of groups stop trading.
         # ====================================================
-        if self.enable_treasury_kill_switch and self.all_treasuries_fail_trend():
+        if len(edges) < 4:
             self.SetHoldings(cash_symbol, 1.0)
-            self.Debug("TREASURY KILL SWITCH: all treasuries failed trend")
+            self.Debug("Less than X groups moving to cash.")
             return
 
         # ============================
@@ -391,6 +407,7 @@ class ZephyrMacroAllocator(QCAlgorithm):
             + f" | cash:{cash_weight:.2f}"
         )
 
+
     # ====================================================
     # helpers
     # ====================================================
@@ -412,8 +429,9 @@ class ZephyrMacroAllocator(QCAlgorithm):
         """
         if symbol not in closes.columns or len(closes[symbol]) < 127:
             return -np.inf
-        prices = closes[symbol]
+        prices = closes[symbol].dropna()
         return float(prices.iloc[-1] / prices.iloc[-127] - 1)
+
 
     def get_duration_regime_for_group(self, closes: pd.DataFrame, symbols: List[Symbol]) -> List[Symbol]:
         """
@@ -467,6 +485,7 @@ class ZephyrMacroAllocator(QCAlgorithm):
 
         return valid_symbols
 
+
     def compute_group_momentum(self, symbols: List[Symbol], closes: pd.DataFrame) -> float:
         """
         Compute aggregate momentum for an asset group.
@@ -491,6 +510,7 @@ class ZephyrMacroAllocator(QCAlgorithm):
                 values.append(mom)
 
         return float(np.mean(values)) if values else 0.0
+
 
     def compute_asset_momentum(self, symbol: Symbol, closes: pd.DataFrame) -> float:
         """
@@ -523,35 +543,43 @@ class ZephyrMacroAllocator(QCAlgorithm):
         ]))
 
 
-    def compute_manual_adx(self, high, low, close, period=14):
-        # 1. Directional Movement
-        up_move = high.diff()
-        down_move = -low.diff()
+    def compute_volume_momentum(self, symbol: Symbol, history: pd.DataFrame) -> float:
+        """
+        Compute volume momentum using EMA of volume changes.
 
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        Calculates the exponential moving average of volume changes to identify
+        sustained increases or decreases in trading activity. Positive momentum
+        confirms price trends with growing participation.
 
-        # 2. True Range
-        tr = pd.concat([
-            high - low,
-            abs(high - close.shift(1)),
-            abs(low - close.shift(1))
-        ], axis=1).max(axis=1)
+        Parameters
+        ----------
+        symbol : Symbol
+            Asset symbol for which volume momentum is computed.
+        history : pandas.DataFrame
+            Historical data containing volume information.
 
-        # 3. Wilder's Smoothing (alpha = 1/N is the standard for ADX)
-        alpha = 1 / period
-        # Use min_periods to ensure we have enough data before returning a value
-        s_plus_dm = pd.Series(plus_dm, index=high.index).ewm(alpha=alpha, adjust=False).mean()
-        s_minus_dm = pd.Series(minus_dm, index=high.index).ewm(alpha=alpha, adjust=False).mean()
-        s_tr = tr.ewm(alpha=alpha, adjust=False).mean()
+        Returns
+        -------
+        float
+            Normalized volume momentum score. Returns 0.0 if insufficient data.
+        """
+        try:
+            if symbol not in history.index.get_level_values(0):
+                return 0.0
 
-        # 4. DI+ / DI-
-        plus_di = 100 * (s_plus_dm / s_tr)
-        minus_di = 100 * (s_minus_dm / s_tr)
+            volume_data = history.loc[symbol]['volume'].tail(self.volume_momentum_lookback)
 
-        # 5. DX & ADX
-        # Using clip(lower=1e-9) prevents division by zero
-        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).clip(lower=1e-9))
-        adx = dx.ewm(alpha=alpha, adjust=False).mean()
+            if len(volume_data) < self.volume_momentum_period + 1:
+                return 0.0
 
-        return adx.iloc[-1]
+            volume_changes = volume_data.pct_change().dropna()
+
+            if len(volume_changes) < self.volume_momentum_period:
+                return 0.0
+
+            alpha = 2 / (self.volume_momentum_period + 1)
+            volume_ema = volume_changes.ewm(alpha=alpha, adjust=False).mean()
+
+            return float(volume_ema.iloc[-1])
+        except:
+            return 0.0
