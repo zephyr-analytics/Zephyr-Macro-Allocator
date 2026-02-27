@@ -6,10 +6,7 @@ import yfinance as yf
 # CONFIG (STRICT QC ALIGNMENT)
 # ============================
 CRYPTO_CAP = 0.05       
-GROUP_CAP = 0.25        
-ENABLE_SMA_FILTER = True
-ENABLE_VOLUME_MOMENTUM = True
-USE_VOL_ADJUSTED = True
+GROUP_CAP = 0.25
 
 VOL_LOOKBACK = 252      
 SMA_PERIOD = 147
@@ -38,7 +35,7 @@ EXEMPT_GROUPS = ["cash", "corp_bonds", "treasury_bonds"]
 # ============================
 all_tickers = sorted(set(sum(GROUPS.values(), [])))
 # Request extra data to ensure indicators (SMA) are ready
-data = yf.download(all_tickers, period="2y", auto_adjust=True, progress=False)
+data = yf.download(all_tickers, period="2y", auto_adjust=True, progress=True)
 closes = data["Close"].ffill()
 volumes = data["Volume"].ffill()
 
@@ -70,7 +67,6 @@ def compute_volume_momentum(ticker, current_vols):
     except: return 0.0
 
 def passes_trend(t, current_closes):
-    if not ENABLE_SMA_FILTER: return True
     px = current_closes[t]
     period = BOND_SMA_PERIOD if any(t in GROUPS[g] for g in ["corp_bonds", "treasury_bonds"]) else SMA_PERIOD
     if len(px) < period: return False
@@ -93,20 +89,29 @@ group_totals = {}
 risk_groups = {g: GROUPS[g] for g in GROUPS}
 risk_groups["corp_bonds"] = get_duration_regime("corp_bonds", closes)
 risk_groups["treasury_bonds"] = get_duration_regime("treasury_bonds", closes)
+cash_mom = compute_asset_momentum(GROUPS["cash"][0], closes)
 
 for group, tickers in risk_groups.items():
     eligible_candidates = {}
     for s in tickers:
-        if group != "cash" and not passes_trend(s, closes): continue
-        
+        if group != "cash" and not passes_trend(s, closes): 
+            continue
+
         asset_mom = compute_asset_momentum(s, closes)
         if asset_mom <= 0: continue
 
-        vol_mom = compute_volume_momentum(s, volumes) if ENABLE_VOLUME_MOMENTUM else 0.0
+        if group in ["treasury_bonds", "corp_bonds"] and asset_mom <= cash_mom:
+            print(f"Group: {group}, Mom: {asset_mom}, Cash Mom: {cash_mom}")
+            continue
+
+        vol_mom = compute_volume_momentum(s, volumes)
         # QC: asset_mom * (1 + tanh(vol_mom))
         asset_edge = asset_mom * (1.0 + np.tanh(vol_mom))
-        if asset_edge > 0:
-            eligible_candidates[s] = asset_edge
+
+        if asset_edge <= 0:
+            continue
+
+        eligible_candidates[s] = asset_edge
 
     if not eligible_candidates: continue
 
@@ -118,30 +123,33 @@ for group, tickers in risk_groups.items():
     # Volatility Adjustment
     group_returns = closes[selected_assets].pct_change().mean(axis=1).dropna()
     if len(group_returns) < VOL_LOOKBACK: continue
-    
+
     # QC: Annualized StDev of log returns
     group_vol = float(np.std(np.log1p(group_returns).tail(VOL_LOOKBACK)) * np.sqrt(252))
 
-    confidence = (np.mean([eligible_candidates[s] for s in selected_assets])) / (group_vol + 1e-6) if USE_VOL_ADJUSTED else 1.0
-    
+    confidence = (np.mean([eligible_candidates[s] for s in selected_assets])) / (group_vol + 1e-6)
+
     vol_moms = [compute_volume_momentum(s, volumes) for s in selected_assets]
-    volume_multiplier = np.tanh(np.mean(vol_moms)) if ENABLE_VOLUME_MOMENTUM else 1.0
+    volume_multiplier = np.tanh(np.mean(vol_moms))
 
     group_multiplier = confidence * volume_multiplier
-    if group_multiplier <= 0: continue
+    if group != "cash" and group_multiplier <= 0: 
+        print(f"Group: {group} - {group_multiplier}")
+        continue
 
     current_group_total = 0
     for s in selected_assets:
         score = group_multiplier * eligible_candidates[s]
         final_asset_scores[s] = score
         current_group_total += score
-    
+
     group_totals[group] = current_group_total
 
 # Breadth Check & Iterative Capping
 active_risk_groups = [g for g in group_totals.keys() if g != "cash"]
 
 if len(active_risk_groups) <= 3:
+    print(f"Groups below min 3 groups: {active_risk_groups}")
     final_alloc = {GROUPS["cash"][0]: 1.0}
 else:
     total_score = sum(final_asset_scores.values())
@@ -176,6 +184,16 @@ else:
         if g_score_sum > 0:
             for s in g_symbols:
                 final_alloc[s] = (final_asset_scores[s] / g_score_sum) * g_weight
+
+# --- GROUP SUMMARY ---
+group_summary = {}
+for group, tickers in risk_groups.items():
+    # Sum the weights of symbols belonging to this group
+    w_sum = sum(final_alloc.get(s, 0) for s in tickers)
+    if w_sum > 0:
+        group_summary[group] = w_sum
+
+print(" | ".join([f"{g.upper()}: {w:.2%}" for g, w in sorted(group_summary.items(), key=lambda x: x[1], reverse=True)]))
 
 # --- RESULTS ---
 print(f"\n{'SYMBOL':<10} | {'WEIGHT':<10}")
