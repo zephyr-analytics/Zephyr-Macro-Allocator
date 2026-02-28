@@ -130,12 +130,12 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
         for symbol in symbols:
             if symbol not in returns_df.columns: continue
             asset_rets = returns_df[symbol].dropna()
-            if len(asset_rets) < 504: continue
+            if len(asset_rets) < 252: continue
 
             var_threshold = np.percentile(asset_rets, 5)
             tail_events = asset_rets[asset_rets <= var_threshold]
             cvar = -tail_events.mean() if not tail_events.empty else asset_rets.std()
-            
+
             cvar = max(cvar, 0.0001)
             weights[symbol] = scores[symbol] / cvar
         return weights
