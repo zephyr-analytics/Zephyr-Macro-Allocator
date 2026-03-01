@@ -14,7 +14,7 @@ def get_momentum_cvar_signals():
     
     # Risk/Portfolio Constraints
     MAX_CAP = 0.25      
-    TARGET_CVAR = 0.02 # 2% Daily CVaR Target
+    TARGET_CVAR = 0.03 # 2% Daily CVaR Target
     CONFIDENCE = 0.05  # 95% Confidence Level (5th percentile)
     HISTORY_DAYS = 1265 # QC standard ~5 years
 
@@ -52,7 +52,7 @@ def get_momentum_cvar_signals():
             # Multi-lookback Momentum
             m_rets = [(cur_price / s_prices.iloc[-d-1]) - 1 for d in lookbacks]
             avg_m = np.mean(m_rets)
-            
+
             if avg_m > 0:
                 all_mom_scores[ticker] = avg_m * vol_ratio
             else:

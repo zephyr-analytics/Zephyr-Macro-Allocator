@@ -21,11 +21,12 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
         for symbol in self.symbols:
             self.securities[symbol].set_fee_model(ConstantFeeModel(0))
 
-        self.target_cvar = 0.02
+        self.target_cvar = 0.03
         self.vol_lookback_short = 21
         self.vol_lookback_long = 42
+        self.lookback = 1265
         self.lookbacks = [21, 63, 126, 189, 252]
-        self.set_warm_up(1265, Resolution.DAILY)
+        self.set_warm_up(self.lookback, Resolution.DAILY)
 
         self.schedule.on(
             self.date_rules.month_start("VTI"),
@@ -37,7 +38,7 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
         """Main orchestrator for the monthly rebalancing logic."""
         if self.is_warming_up: return
         
-        history = self.history(self.symbols, 1265, Resolution.DAILY, data_normalization_mode=DataNormalizationMode.TOTAL_RETURN)
+        history = self.history(self.symbols, self.lookback, Resolution.DAILY, data_normalization_mode=DataNormalizationMode.TOTAL_RETURN)
         if history.empty: return
         
         prices = history['close'].unstack(level=0)
@@ -135,7 +136,7 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
             var_threshold = np.percentile(asset_rets, 5)
             tail_events = asset_rets[asset_rets <= var_threshold]
             cvar = -tail_events.mean() if not tail_events.empty else asset_rets.std()
-
+            
             cvar = max(cvar, 0.0001)
             weights[symbol] = scores[symbol] / cvar
         return weights
