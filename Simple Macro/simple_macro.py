@@ -14,10 +14,10 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
         self.core_tickers = ["VTI", "VEA", "VWO", "BND", "BNDX", "EMB", "DBC", "GLD", "VGIT", "VGLT"]
         self.sector_tickers = ["IXP", "RXI", "KXI", "IXC", "IXG", "IXJ", "EXI", "MXI", "IXN", "JXI", "REET"]
         self.bond_tickers = ["BND", "BNDX", "VGIT"]
-        
+
         self.all_tickers = self.core_tickers + self.sector_tickers
         self.symbols = [self.add_equity(ticker, Resolution.DAILY).Symbol for ticker in self.all_tickers]
-        
+
         for symbol in self.symbols:
             self.securities[symbol].set_fee_model(ConstantFeeModel(0))
 
@@ -37,16 +37,16 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
     def rebalance(self):
         """Main orchestrator for the monthly rebalancing logic."""
         if self.is_warming_up: return
-        
+
         history = self.history(self.symbols, self.lookback, Resolution.DAILY, data_normalization_mode=DataNormalizationMode.TOTAL_RETURN)
         if history.empty: return
-        
+
         prices = history['close'].unstack(level=0)
         returns_df = prices.pct_change()
 
         all_mom_scores = self.get_momentum_scores(prices)
         valid_symbols = self.select_universe(all_mom_scores)
-        
+
         if len(valid_symbols) <= 4:
             self.apply_safety_switch()
             return
@@ -133,7 +133,7 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
             asset_rets = returns_df[symbol].dropna()
             if len(asset_rets) < 252: continue
 
-            var_threshold = np.percentile(asset_rets, 5)
+            var_threshold = np.percentile(asset_rets, 1)
             tail_events = asset_rets[asset_rets <= var_threshold]
             cvar = -tail_events.mean() if not tail_events.empty else asset_rets.std()
             

@@ -5,17 +5,17 @@ import numpy as np
 def get_momentum_cvar_signals():
     # --- CONFIGURATION (Aligned with QC) ---
     core_tickers = ["VTI", "VEA", "VWO", "BND", "BNDX", "EMB", "DBC", "GLD", "VGIT", "VGLT"]
-    sector_tickers = ["IXP", "RXI", "KXI", "IXC", "IXG", "IXJ", "EXI", "MXI", "IXN", "IXU"]
+    sector_tickers = ["IXP", "RXI", "KXI", "IXC", "IXG", "IXJ", "EXI", "MXI", "IXN", "JXI", "REET"]
     bond_tickers = ["BND", "BNDX", "VGIT"]
     cash_substitute = "SHV"
-    
+
     all_tickers = list(set(core_tickers + sector_tickers + [cash_substitute]))
     lookbacks = [21, 63, 126, 189, 252]
-    
+
     # Risk/Portfolio Constraints
     MAX_CAP = 0.25      
     TARGET_CVAR = 0.03 # 2% Daily CVaR Target
-    CONFIDENCE = 0.05  # 95% Confidence Level (5th percentile)
+    CONFIDENCE = 0.01  # 95% Confidence Level (5th percentile)
     HISTORY_DAYS = 1265 # QC standard ~5 years
 
     # 1. FETCH DATA
@@ -25,7 +25,7 @@ def get_momentum_cvar_signals():
     volumes = data['Volume']
     # Use fill_method=None to avoid warnings in newer pandas
     returns_df = prices.pct_change(fill_method=None)
-    
+
     all_mom_scores = {}
 
     # 2. CALCULATE VOLUME-ADJUSTED MOMENTUM
@@ -43,11 +43,11 @@ def get_momentum_cvar_signals():
         short_vol = s_vols.iloc[-21:].mean()
         long_vol = s_vols.iloc[-42:].mean()
         vol_ratio = short_vol / long_vol if long_vol > 0 else 0.5
-
+        print(f"Ticker: {ticker}, Vol Ratio: {vol_ratio}")
         # Trend Filter (SMA length varies by asset class)
         sma_len = 126 if ticker in bond_tickers else 168
         sma = s_prices.iloc[-sma_len:].mean()
-        
+
         if cur_price > sma:
             # Multi-lookback Momentum
             m_rets = [(cur_price / s_prices.iloc[-d-1]) - 1 for d in lookbacks]
