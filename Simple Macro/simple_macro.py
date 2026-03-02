@@ -136,7 +136,7 @@ class MomentumCVaRAlgorithm(QCAlgorithm):
             var_threshold = np.percentile(asset_rets, 1)
             tail_events = asset_rets[asset_rets <= var_threshold]
             cvar = -tail_events.mean() if not tail_events.empty else asset_rets.std()
-            
+
             cvar = max(cvar, 0.0001)
             weights[symbol] = scores[symbol] / cvar
         return weights

@@ -1,138 +1,162 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from datetime import datetime
 
-def get_momentum_cvar_signals():
-    # --- CONFIGURATION (Aligned with QC) ---
-    core_tickers = ["VTI", "VEA", "VWO", "BND", "BNDX", "EMB", "DBC", "GLD", "VGIT", "VGLT"]
-    sector_tickers = ["IXP", "RXI", "KXI", "IXC", "IXG", "IXJ", "EXI", "MXI", "IXN", "JXI", "REET"]
-    bond_tickers = ["BND", "BNDX", "VGIT"]
-    cash_substitute = "SHV"
-
-    all_tickers = list(set(core_tickers + sector_tickers + [cash_substitute]))
-    lookbacks = [21, 63, 126, 189, 252]
-
-    # Risk/Portfolio Constraints
-    MAX_CAP = 0.25      
-    TARGET_CVAR = 0.03 # 2% Daily CVaR Target
-    CONFIDENCE = 0.01  # 95% Confidence Level (5th percentile)
-    HISTORY_DAYS = 1265 # QC standard ~5 years
-
-    # 1. FETCH DATA
-    # Fetching 6 years to ensure enough data for the 1265-day returns window + SMA calculation
-    data = yf.download(all_tickers, period="6y", interval="1d", auto_adjust=True, progress=False)
-    prices = data['Close']
-    volumes = data['Volume']
-    # Use fill_method=None to avoid warnings in newer pandas
-    returns_df = prices.pct_change(fill_method=None)
-
-    all_mom_scores = {}
-
-    # 2. CALCULATE VOLUME-ADJUSTED MOMENTUM
-    for ticker in (core_tickers + sector_tickers):
-        if ticker not in prices.columns: continue
-
-        s_prices = prices[ticker].dropna()
-        s_vols = volumes[ticker].dropna()
+class LocalMomentumCVaR:
+    def __init__(self):
+        # --- CONFIGURATION (Synced with QC) ---
+        self.core_tickers = ["VTI", "VEA", "VWO", "BND", "BNDX", "EMB", "DBC", "GLD", "VGIT", "VGLT"]
+        self.sector_tickers = ["IXP", "RXI", "KXI", "IXC", "IXG", "IXJ", "EXI", "MXI", "IXN", "JXI", "REET"]
+        self.bond_tickers = ["BND", "BNDX", "VGIT"]
+        self.cash_substitute = "SHV"
         
-        if len(s_prices) < 253: continue
+        self.all_tickers = list(set(self.core_tickers + self.sector_tickers + [self.cash_substitute]))
+        
+        # Risk & Lookback Parameters
+        self.target_cvar = 0.03
+        self.max_cap = 0.25
+        self.history_days = 1265 
+        self.lookbacks = [21, 63, 126, 189, 252]
+        self.confidence_level = 1  # 1% for asset-level (CVaR tail)
+        self.port_confidence = 5   # 5% for portfolio-level (Scaling)
 
-        cur_price = s_prices.iloc[-1]
+    def run(self):
+        # 1. FETCH DATA
+        print(f"Fetching data for {len(self.all_tickers)} symbols...")
+        # Only Close prices needed now
+        data = yf.download(self.all_tickers, period="6y", interval="1d", auto_adjust=True, progress=False)
+        prices = data['Close']
+        returns_df = prices.pct_change(fill_method=None)
 
-        # Volume Acceleration Ratio (21d avg / 42d avg)
-        short_vol = s_vols.iloc[-21:].mean()
-        long_vol = s_vols.iloc[-42:].mean()
-        vol_ratio = short_vol / long_vol if long_vol > 0 else 0.5
-        print(f"Ticker: {ticker}, Vol Ratio: {vol_ratio}")
-        # Trend Filter (SMA length varies by asset class)
-        sma_len = 126 if ticker in bond_tickers else 168
-        sma = s_prices.iloc[-sma_len:].mean()
+        # 2. CALCULATE MOMENTUM SCORES (Price-Only + SMA Filter)
+        all_mom_scores = self.get_momentum_scores(prices)
 
-        if cur_price > sma:
-            # Multi-lookback Momentum
-            m_rets = [(cur_price / s_prices.iloc[-d-1]) - 1 for d in lookbacks]
-            avg_m = np.mean(m_rets)
+        # 3. SELECT UNIVERSE
+        valid_symbols = self.select_universe(all_mom_scores)
+        print(f"Assets passing filters: {valid_symbols}")
 
-            if avg_m > 0:
-                all_mom_scores[ticker] = avg_m * vol_ratio
+        # 4. SAFETY SWITCH
+        if len(valid_symbols) < 4:
+            print("Safety Switch Triggered: Insufficient signals. Moving to 100% Cash.")
+            return {self.cash_substitute: 1.0}
+
+        # 5. CALCULATE CVaR WEIGHTS
+        weights_map = self.calculate_cvar_weights(valid_symbols, returns_df, all_mom_scores)
+
+        # 6. NORMALIZATION & CAPPING
+        capped_weights = self.apply_weight_caps(weights_map)
+
+        # 7. FINAL SCALING & CASH ALLOCATION
+        final_allocations = self.get_final_allocations(capped_weights, returns_df)
+        
+        return final_allocations
+
+    def get_momentum_scores(self, prices):
+        scores = {}
+        for ticker in (self.core_tickers + self.sector_tickers):
+            if ticker not in prices.columns: continue
+            
+            s_prices = prices[ticker].dropna()
+            if len(s_prices) < 253: continue
+
+            cur_price = s_prices.iloc[-1]
+            
+            # Trend Filter (SMA 126 for Bonds, 168 for Equities)
+            sma_len = 126 if ticker in self.bond_tickers else 168
+            sma = s_prices.iloc[-sma_len:].mean()
+
+            # Logic: Price must be above SMA, and average momentum must be positive
+            if cur_price > sma:
+                m_rets = [(cur_price / s_prices.iloc[-d-1]) - 1 for d in self.lookbacks]
+                avg_m = np.mean(m_rets)
+                scores[ticker] = max(avg_m, 0)
             else:
-                all_mom_scores[ticker] = 0
-        else:
-            all_mom_scores[ticker] = 0
+                scores[ticker] = 0
+        return scores
 
-    # 3. SELECT UNIVERSE (Top 4 Sectors + All positive Core)
-    sector_scores = {t: all_mom_scores[t] for t in sector_tickers if all_mom_scores.get(t, 0) > 0}
-    top_4_sectors = sorted(sector_scores, key=sector_scores.get, reverse=True)[:4]
-    core_valid = [t for t in core_tickers if all_mom_scores.get(t, 0) > 0]
-    
-    valid_symbols = core_valid + top_4_sectors
-
-    # 4. SAFETY SWITCH (If too few signals, go to cash)
-    if len(valid_symbols) < 4:
-        return {ticker: (1.0 if ticker == cash_substitute else 0.0) for ticker in all_tickers}
-
-    # 5. ASSET-LEVEL CVaR WEIGHTING
-    weights_map = {}
-    analysis_returns = returns_df.tail(HISTORY_DAYS)
-
-    for ticker in valid_symbols:
-        asset_rets = analysis_returns[ticker].dropna()
-        if len(asset_rets) < 504: continue
-
-        # Calculate CVaR (Expected Shortfall)
-        var_limit = np.percentile(asset_rets, CONFIDENCE * 100)
-        tail = asset_rets[asset_rets <= var_limit]
-        cvar = -tail.mean() if not tail.empty else asset_rets.std()
-
-        # Weight = Momentum Score / Risk
-        weights_map[ticker] = all_mom_scores[ticker] / max(cvar, 0.0001)
-
-    # 6. NORMALIZATION & CAPPING (Iterative)
-    total_raw = sum(weights_map.values())
-    if total_raw == 0: return {cash_substitute: 1.0}
-    
-    current_weights = {t: w / total_raw for t, w in weights_map.items()}
-
-    for _ in range(10):
-        total_excess = sum(max(0, w - MAX_CAP) for w in current_weights.values())
-        if total_excess <= 1e-6: break
+    def select_universe(self, scores):
+        # Top 4 Sectors by Momentum
+        sector_scores = {t: scores[t] for t in self.sector_tickers if scores.get(t, 0) > 0}
+        top_4_sectors = sorted(sector_scores, key=sector_scores.get, reverse=True)[:4]
         
-        eligible = [t for t, w in current_weights.items() if w < MAX_CAP]
-        if not eligible: break
+        # All Core assets with positive momentum
+        core_valid = [t for t in self.core_tickers if scores.get(t, 0) > 0]
         
-        for t in current_weights:
-            if current_weights[t] > MAX_CAP:
-                current_weights[t] = MAX_CAP
+        return list(set(core_valid + top_4_sectors))
+
+    def calculate_cvar_weights(self, symbols, returns_df, scores):
+        weights = {}
+        analysis_returns = returns_df.tail(self.history_days)
         
-        rem_sum = sum(current_weights[t] for t in eligible)
-        for t in eligible:
-            current_weights[t] += total_excess * (current_weights[t] / rem_sum)
+        for ticker in symbols:
+            asset_rets = analysis_returns[ticker].dropna()
+            if len(asset_rets) < 504: continue
 
-    # 7. PORTFOLIO CVaR TARGETING (Scaling)
-    weights_series = pd.Series(current_weights)
-    # Ensure columns match the weights
-    portfolio_rets = analysis_returns[weights_series.index].dot(weights_series)
-    p_var_threshold = np.percentile(portfolio_rets, CONFIDENCE * 100)
-    portfolio_cvar = -portfolio_rets[portfolio_rets <= p_var_threshold].mean()
+            # Asset-level CVaR (Expected Shortfall at 1% percentile)
+            var_limit = np.percentile(asset_rets, self.confidence_level)
+            tail = asset_rets[asset_rets <= var_limit]
+            cvar = -tail.mean() if not tail.empty else asset_rets.std()
+            
+            # Risk-Adjusted Weight = Momentum / CVaR
+            weights[ticker] = scores[ticker] / max(cvar, 0.0001)
+        return weights
 
-    # Scaling factor ensures we don't exceed target risk
-    scaling_factor = min(1.0, TARGET_CVAR / portfolio_cvar) if portfolio_cvar > 0 else 1.0
+    def apply_weight_caps(self, weights_map):
+        total_raw = sum(weights_map.values())
+        if total_raw == 0: return {}
+        
+        current_weights = {t: w / total_raw for t, w in weights_map.items()}
 
-    # 8. FINAL ALLOCATION
-    final_weights = {t: 0.0 for t in all_tickers}
-    total_momentum_exposure = 0.0
-    
-    for t, w in current_weights.items():
-        scaled_w = w * scaling_factor
-        final_weights[t] = scaled_w
-        total_momentum_exposure += scaled_w
+        # Iterative Capping to redistribute excess weight
+        for _ in range(10):
+            total_excess = sum(max(0, w - self.max_cap) for w in current_weights.values())
+            if total_excess <= 1e-6: break
+            
+            eligible = [t for t, w in current_weights.items() if w < self.max_cap]
+            if not eligible: break
+            
+            for t in current_weights:
+                if current_weights[t] > self.max_cap:
+                    current_weights[t] = self.max_cap
+            
+            rem_sum = sum(current_weights[t] for t in eligible)
+            for t in eligible:
+                current_weights[t] += total_excess * (current_weights[t] / rem_sum)
+        return current_weights
 
-    final_weights[cash_substitute] = max(0, 1.0 - total_momentum_exposure)
-    return final_weights
+    def get_final_allocations(self, weights, returns_df):
+        if not weights: return {self.cash_substitute: 1.0}
+        
+        # Portfolio-level Risk Assessment
+        weights_series = pd.Series(weights)
+        sub_returns = returns_df[weights_series.index].tail(252).dropna()
+        portfolio_rets = sub_returns.dot(weights_series)
+        
+        # Portfolio CVaR at 5% percentile
+        p_var_threshold = np.percentile(portfolio_rets, self.port_confidence)
+        portfolio_cvar = -portfolio_rets[portfolio_rets <= p_var_threshold].mean()
+
+        # Scale down if portfolio risk exceeds TARGET_CVAR
+        scaling_factor = min(1.0, self.target_cvar / portfolio_cvar) if portfolio_cvar > 0 else 1.0
+
+        final_weights = {t: 0.0 for t in self.all_tickers}
+        total_momentum_exposure = 0.0
+        
+        for t, w in weights.items():
+            scaled_w = w * scaling_factor
+            final_weights[t] = scaled_w
+            total_momentum_exposure += scaled_w
+
+        # Remainder goes to Cash (SHV)
+        final_weights[self.cash_substitute] = max(0, 1.0 - total_momentum_exposure)
+        return final_weights
 
 if __name__ == "__main__":
-    signals = get_momentum_cvar_signals()
-    print(f"\n--- TARGET ALLOCATIONS ({pd.Timestamp.now().date()}) ---")
+    algo = LocalMomentumCVaR()
+    signals = algo.run()
+    
+    print(f"\n--- TARGET ALLOCATIONS ({datetime.now().date()}) ---")
     active = sorted({k: v for k, v in signals.items() if v > 0.001}.items(), key=lambda x: x[1], reverse=True)
     for ticker, weight in active:
         tag = "(Cash/Safe)" if ticker == "SHV" else ""
